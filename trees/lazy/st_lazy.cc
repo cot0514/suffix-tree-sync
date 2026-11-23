@@ -321,6 +321,9 @@ void SuffixTree::append(int seq_id, int token) {
     for (Node*& active_node : active_nodes) {
         Node* node = active_node;
         Node* child = nullptr;
+        // [lazy] 논리적으로 지워진 자식(count 0)을 먼저 떼어 내야 아래 경우 분석의 전제
+        // (Case 1a: 자식 없음, Case 2: 자식 1개, 1b: tail 뒤에 붙여도 count 순서 유지)가 원본과 같아진다.
+        _purge_zombies(node);
         auto it = node->children.find(token);
         if (it != node->children.end()) {
             child = it->second.get();
@@ -811,6 +814,9 @@ std::pair<Node*, int> SuffixTree::_match_context(
                 return {nullptr, -1};
             }
             node = it->second.get();
+            if (node->count == 0) {
+                return {nullptr, -1};   // [lazy] 논리적으로 지워진 노드 = 없는 것
+            }
             // Keep a pointer directly to the reference data for efficiency.
             ref_data = _seqs[node->ref_seq].data() + node->ref_idx;
             idx = 0;
@@ -840,7 +846,7 @@ Draft SuffixTree::_speculate_path(Node* node, int idx,
             idx++;
         } else {
             Node* child = node->head_child;
-            if (child == nullptr) {
+            if (child == nullptr || child->count == 0) {   // [lazy] 남은 자식이 모두 지워짐
                 break;
             }
             int64_t count = child->count;
@@ -892,7 +898,7 @@ Draft SuffixTree::_speculate_tree(Node* node, int idx,
                           static_cast<int>(ret.token_ids.size()) - 1);
         } else {
             Node* child = it.node->head_child;
-            while (child) {
+            while (child && child->count > 0) {   // [lazy] count 0 = 지워진 자식 (맨 뒤)
                 float prob = it.prob * child->count /
                     static_cast<float>(it.node->count);
                 if (prob < min_token_prob) {
@@ -932,6 +938,128 @@ size_t SuffixTree::estimate_memory() const {
         total += sizeof(nodes) * nodes.size();
     }
     return total;
+}
+
+// ---------------------------------------------------------------------------
+// [lazy] 논리적 삭제 / 물리적 삭제
+// 원본 remove() 의 앞부분(count 줄이기 + endpoints 지우기)만 한다. 원본은 count 가 1 인 자식을
+// 서브트리째 떼어 내지만, 여기서는 count 를 0 으로 만들고 멈춘다(형제 리스트 맨 뒤로 이동).
+// 그 아래 노드들의 count 는 그대로지만 count 0 노드 밑이라 아무도 내려가지 않는다.
+void SuffixTree::mark_removed(int seq_id) {
+    const std::vector<int>& seq = _seqs[seq_id];
+    for (int start = 0; start < static_cast<int>(seq.size()); start++) {
+        Node* node = _root.get();
+        node->count--;
+        int idx = start;
+        while (idx < static_cast<int>(seq.size())) {
+            auto it = node->children.find(seq[idx]);
+            if (it == node->children.end()) {
+                break;
+            }
+            Node* child = it->second.get();
+            assert(child->count > 0);
+            bool last = child->count == 1;
+            _decrement_count(child);   // 형제 순서까지 원본과 똑같이 바뀐다
+            if (last) {
+                break;                 // 원본: 여기서 서브트리째 떼어 냄 → lazy: 좀비로 남김
+            }
+            if (child->endpoints.contains(seq_id)) {
+                child->endpoints.erase(seq_id);
+            }
+            idx += child->length;
+            node = child;
+        }
+    }
+    _pending_mu.lock();
+    _pending_remove.push_back(seq_id);
+    _pending_mu.unlock();
+}
+
+int SuffixTree::flush_removed() {
+    // end_step 에서만 불리므로 다른 스레드가 없다. 그래도 목록은 락을 잡고 꺼낸다.
+    std::vector<int32_t> ids;
+    _pending_mu.lock();
+    ids.swap(_pending_remove);
+    _pending_mu.unlock();
+    for (int id : ids) _physical_remove(id);
+    return static_cast<int>(ids.size());
+}
+
+int SuffixTree::_purge_zombies(Node* node) {
+    int n = 0;
+    // count 내림차순 리스트라 count 0 인 자식은 모두 맨 뒤에 있다
+    while (node->tail_child && node->tail_child->count == 0) {
+        Node* z = node->tail_child;
+        _remove_from_siblings(z);
+        node->children.erase(z->token);   // unique_ptr 이 서브트리째 해제
+        n++;
+    }
+    return n;
+}
+
+// 원본 remove() 의 뒷부분. count 는 mark_removed 에서 이미 줄였으므로 경로를 따라 내려가며
+// 좀비를 떼고, 마지막 노드를 자식과 합치고, 이 seq 를 가리키던 ref 를 다른 seq 로 바꾼다.
+void SuffixTree::_physical_remove(int seq_id) {
+    const std::vector<int>& seq = _seqs[seq_id];
+    std::vector<Node*> path;
+    for (int start = 0; start < static_cast<int>(seq.size()); start++) {
+        Node* node = _root.get();
+        int idx = start;
+        path.clear();
+        while (idx < static_cast<int>(seq.size())) {
+            _purge_zombies(node);
+            auto it = node->children.find(seq[idx]);
+            if (it == node->children.end()) {
+                break;
+            }
+            Node* child = it->second.get();
+            idx += child->length;
+            node = child;
+            path.push_back(node);
+        }
+        _purge_zombies(node);
+        // The last visited node may be mergeable with its child. (원본과 같음)
+        if (node != _root.get() && node->children.size() == 1) {
+            const auto& it = *node->children.begin();
+            std::unique_ptr<Node>& child_uptr = node->children[it.first];
+            if (node->count == child_uptr->count) {
+                child_uptr->token = node->token;
+                child_uptr->length += node->length;
+                child_uptr->ref_idx -= node->length;
+                child_uptr->parent = node->parent;
+                _replace_in_siblings(node, child_uptr.get());
+                path.back() = node = child_uptr.release();
+                node->parent->children[node->token].reset(node);
+            }
+        }
+        // ref_seq and ref_idx of all nodes in the path may need to be updated. (원본과 같음)
+        // 단, 아무 잎까지 내려갈 때 좀비 서브트리로 들어가지 않도록 좀비를 먼저 뗀다.
+        Node* leaf = node;
+        int distance = 0;
+        while (true) {
+            _purge_zombies(leaf);
+            if (leaf->children.empty()) break;
+            leaf = (*leaf->children.begin()).second.get();
+            distance += leaf->length;
+        }
+        if (leaf->endpoints.empty() || leaf->endpoints.contains(seq_id)) {
+            continue;
+        }
+        const auto& ref = *leaf->endpoints.begin();
+        int32_t ref_seq = ref.first;
+        int32_t ref_idx = ref.second - distance;
+        while (!path.empty()) {
+            Node* n = path.back();
+            path.pop_back();
+            ref_idx -= n->length;
+            if (n->ref_seq == seq_id) {
+                n->ref_seq = ref_seq;
+                n->ref_idx = ref_idx;
+            }
+        }
+    }
+    _seqs.erase(seq_id);
+    _active_nodes.erase(seq_id);
 }
 
 // ---------------------------------------------------------------------------

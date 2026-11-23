@@ -24,6 +24,7 @@
 
 #include "../../third_party/arctic/int32_map.h"
 #include "../../third_party/arctic/suffix_tree.h"   // ::Draft (측정 틀과 같은 타입)
+#include "../../common/locks.h"                      // [lazy] 삭제 대기 목록 보호용 Mutex
 
 namespace lazy {
 using ::Draft;
@@ -143,7 +144,33 @@ public:
     // → 갱신 순서가 달라도 같은 토큰들을 넣었으면 같은 값이 나와야 한다.
     uint64_t content_digest();
 
+    // [lazy] 논리적 삭제: seq 의 모든 suffix 경로에서 count 만 줄이고(형제 재정렬 포함, 원본과 같음)
+    // 대기 목록에 넣는다. count 가 0 이 된 노드("좀비")는 떼지 않고 형제 리스트 맨 뒤에 남긴다.
+    //  - 추측(_match_context)은 count 0 노드를 없는 것으로 보므로 원본 remove 직후와 같은 결과
+    //  - 갱신(append)은 활성 노드의 자식을 보기 전에 맨 뒤 좀비를 잘라 낸다 (_purge_zombies)
+    //  - 지울 seq 의 토큰(_seqs)은 flush 때까지 남아 있어 그 seq 를 ref_seq 로 가리키는 노드도 유효
+    // 전제: 대기 중인 seq_id 로 flush 전에 다시 extend 하지 않는다 (측정 틀은 지난 답변만 지움).
+    void mark_removed(int seq_id);
+
+    // [lazy] 물리적 삭제: 대기 목록 seq 의 suffix 경로를 다시 걸으며 좀비 떼기·노드 합치기·
+    // ref 갱신을 하고 _seqs/_active_nodes 에서 지운다.
+    // 다른 호출과 겹치지 않는 한 스레드(end_step)에서만 부른다. 지운 개수를 돌려준다.
+    int flush_removed();
+
+    size_t pending_removals() const { return _pending_remove.size(); }
+
 private:
+
+    // [lazy] 삭제 대기 목록 (mark_removed 가 여러 스레드에서 동시에 불려도 되도록 락으로 보호)
+    std::vector<int32_t> _pending_remove;
+    Mutex _pending_mu;
+
+    // [lazy] node 의 자식 중 count 0 인 것(형제 리스트 맨 뒤에 모여 있음)을 서브트리째 떼어 낸다.
+    // 떼어 낸 노드 수를 돌려준다.
+    int _purge_zombies(Node* node);
+
+    // [lazy] 물리적 삭제 본체 (seq 하나)
+    void _physical_remove(int seq_id);
 
     // Maximum depth of the suffix tree.
     int _max_depth;
