@@ -1,5 +1,6 @@
 // --mode=lazy : 삭제는 표시만 하고(논리적 삭제), 실제 제거는 스텝 끝 end_step() 에서 한꺼번에 (Lazy)
-// 2단계: remove() = 삭제 대기 목록에 넣기, end_step() = 목록의 seq 를 원본 remove 로 제거.
+// 2단계: remove() = 경로의 count 만 줄이기(count 0 노드 = 지워짐 표시) + 대기 목록에 넣기,
+//        end_step() = 좀비 떼기·노드 합치기·ref 갱신·_seqs 정리 (st_lazy.cc 의 [lazy] 부분).
 //        갱신(extend)은 아직 락이 없어 한 스레드 (par_update=false).
 #include "../common/locks.h"
 #include "../common/tree_iface.h"
