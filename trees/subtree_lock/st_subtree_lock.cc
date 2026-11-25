@@ -13,6 +13,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// [suffix-tree-sync 수정] Arctic Inference 의 SuffixTree(커밋 aca5d9a)를 복사해
+// 서브트리 락과 루트 락을 넣어 여러 스레드가 동시에 갱신할 수 있게 고친 파일.
+
 #include <cassert>
 #include <iostream>
 #include <queue>

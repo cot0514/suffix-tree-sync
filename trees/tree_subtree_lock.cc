@@ -17,7 +17,7 @@ public:
         return t.speculate(ctx, p.max_spec_tokens, p.max_spec_factor, p.max_spec_offset,
                            p.min_token_prob, p.use_tree_spec);
     }
-        std::string check() override { return t.check_integrity(); }
+    std::string check() override { return t.check_integrity(); }
     uint64_t digest() override { return t.content_digest(); }   // --check 가 serial 과 비교
 };
 REGISTER_TREE("subtree_lock", "one lock per subtree (first token, 64 locks) plus a root lock", SubtreeLockTree);
