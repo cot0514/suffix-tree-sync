@@ -1,6 +1,6 @@
 #!/bin/bash
-# 3050 추가 실험 2: (A) 추측 길이를 실제로 늘려 스텝 시간과의 관계 확인, (B) 높은 적중률 프롬프트.
-# 사용: bash vllm_path/gpu_sweep2.sh [배치=64]   (약 25분, 7회)
+# 3050 추가 실험: (A) 추측 길이를 실제로 늘려 스텝 시간과의 관계 확인, (B) 높은 적중률 프롬프트.
+# 사용: bash vllm_path/gpu_sweep_draft_limit.sh [배치=64]   (약 25분, 7회)
 export VLLM_USE_FLASHINFER_SAMPLER=0
 source ~/venv_vllm/bin/activate
 cd ~/suffix-tree-sync
@@ -9,7 +9,7 @@ MODEL=Qwen/Qwen2.5-1.5B
 mkdir -p results
 run() { # 태그 프롬프트 글자수 spec k 추가옵션...
   local tag=$1 P=$2 PC=$3 S=$4 K=$5; shift 5
-  local out=results/sweep2_${tag}_b${B}.json
+  local out=results/draft_limit_${tag}_b${B}.json
   echo "-- $tag"
   timeout 600 python vllm_path/gpu_measure.py --model $MODEL --spec $S --spec-tokens $K --prompts $P \
      --batch $B --prompt-chars $PC --max-tokens 192 --gpu-util 0.85 --out $out "$@" 2>&1 \
@@ -25,8 +25,8 @@ for K in 8 16; do run rep_default_k$K repeat 500 suffix $K; done
 python - <<PY
 import json,glob,os
 print(f"{'tag':22}{'step_ms':>9}{'prop_ms':>8}{'G_ms':>8}{'draft/req':>10}{'tok/req':>8}{'tok/ms':>8}{'n':>4}")
-for f in sorted(glob.glob("results/sweep2_*_b${B}.json")):
-    r=json.load(open(f)); tag=os.path.basename(f)[7:-len("_b${B}.json")]
+for f in sorted(glob.glob("results/draft_limit_*_b${B}.json")):
+    r=json.load(open(f)); tag=os.path.basename(f)[len("draft_limit_"):-len("_b${B}.json")]
     tp=r['peak_running']*r['tokens_per_req_step']/r['step_ms']
     print(f"{tag:22}{r['step_ms']:>9.1f}{r['propose_ms']:>8.2f}{r['gpu_side_ms']:>8.1f}{r.get('drafted_per_req_step',0):>10.2f}{r['tokens_per_req_step']:>8.2f}{tp:>8.2f}{r['steps_steady']:>4}")
 PY

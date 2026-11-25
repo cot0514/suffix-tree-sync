@@ -228,7 +228,7 @@ bin/tree_bench_tsan data/tokens_code.bin --mode=<이름> --sched=phase --threads
 |---|---|
 | 아무 경고 없음 | 통과 |
 | `WARNING: ThreadSanitizer: data race` | 경쟁 발견. 아래 `Read ... by thread T1` / `Previous write ... by thread T3` 두 묶음에서 **내 파일(`trees/<이름>/...`)이 나오는 가장 위 줄**이 원인 위치 |
-| `FATAL: ThreadSanitizer: unexpected memory mapping` | WSL2에서 가끔 나옴. `sudo sysctl vm.mmap_rnd_bits=28` 실행 후 다시 |
+| `FATAL: ThreadSanitizer: unexpected memory mapping` | WSL2에서 자주 나옴. 실행 명령 앞에 `setarch $(uname -m) -R`을 붙이기 (예: `setarch $(uname -m) -R bin/tree_bench_tsan ...`). 또는 `sudo sysctl vm.mmap_rnd_bits=28` 실행 후 다시 |
 
 - 노드만이 아니라 트리 전체가 같이 쓰는 표(`_seqs`, `_active_nodes`, `append` 첫 부분)도 경쟁 대상입니다. 락으로 보호하거나 병렬 구간 전에 미리 만들어 두세요
 - `optimistic`·`lazy`는 처음엔 경고가 나오는 게 정상입니다. 락 없이 읽는 칸(자식 포인터, count, 삭제 표시 등)을 `std::atomic`으로 바꿔야 없어집니다
@@ -250,15 +250,42 @@ bin/tree_bench_tsan data/tokens_code.bin --mode=<이름> --sched=phase --threads
 
 - Python 스레드는 쓰지 않습니다. 일 하나가 10~20µs로 작아서 GIL을 요청마다 풀고 잡으면 오히려 느려집니다
 - vLLM의 답변·스케줄링·GPU는 그대로입니다. 묶어서 부르기만 하면 결과가 비트 단위로 같고, `phase` 병렬이면 추측이 99~100% 같습니다 (5장 `vllm%` 열)
-- GPU 없이 CPU 시간만 잽니다. 전체 속도 향상 폭은 GPU 한 스텝 시간(Colab에서 잠깐 측정, 안 되면 개발사 보고치)을 더해 추정합니다
+- `run_compare.py`는 GPU 없이 CPU 시간만 잽니다. 전체 속도 향상 폭은 `vllm_path/gpu_measure.py`로 GPU 한 스텝 시간을 따로 재서 추정합니다. 묶음 호출을 vLLM 에 직접 바꿔 끼워 잴 때는 `gpu_measure.py --proposer batch` (먼저 `--proposer check` 로 추측이 맞는지 확인, 전역 트리 삭제는 지원하지 않음)
 
 ### 환경
 | 항목 | 내용 |
 |---|---|
 | 환경 | Linux 필요 → PC의 **WSL2** (6장 설치와 같음, `tree_bench`와 같은 CPU) |
 | 필요한 것 | vLLM이 쓰는 Arctic Inference 소스 빌드 (cmake, nanobind). 저장소에는 넣지 않음 |
-| 코드 위치 | `vllm_path/` (준비 중, subtree_lock 담당만 수정) |
-| 순서 | 요청별 호출·묶음 1스레드를 먼저 재고, 4방식을 main에 합친 뒤 N스레드를 잼 |
+| 코드 위치 | `vllm_path/` (subtree_lock 담당만 수정) |
+| 순서 | 방식들을 main에 합친 뒤 방식별 N스레드를 같은 PC에서 잼 |
+
+### 실행 (WSL2)
+처음 한 번: 파이썬 가상환경 `~/venv_arctic`(cmake, ninja, `nanobind==2.9.2`, numpy)을 만들고, `third_party/arctic/SOURCE.txt`에 적힌 커밋의 Arctic Inference를 빌드한 뒤 `bash vllm_path/stage.sh`를 실행합니다 (필요한 폴더 위치는 파일 맨 위 주석).
+
+```
+bash vllm_path/build.sh
+source ~/venv_arctic/bin/activate
+python vllm_path/run_compare.py data/tokens_code.bin --quick --mode=<이름>
+python vllm_path/run_compare.py data/tokens_code.bin --mode=<이름> --threads=1,4,8 --csv=results/vllm_path.csv
+```
+
+| 옵션 | 기본값 | 뜻 |
+|---|---|---|
+| `--mode` | subtree_lock | 묶음 호출의 전역 트리 방식 (한 번에 하나) |
+| `--threads` | 1,2,4,6,8 | 묶음 호출의 스레드 수 |
+| `--b`, `--n_cached` | 256, 10000 | 배치, 트리에 미리 넣는 지난 답변 수 |
+| `--request_start` | `n_cached` | 처리하는 요청이 시작하는 기록 번호. 트리 크기를 비교할 때 고정 (예: 10000) |
+| `--check`, `--quick` | | 트리 내용을 매 스텝 비교, 작은 설정으로 확인 (`--check` 포함). 속도를 잴 때는 빼기 |
+
+판정은 4장과 같은 뜻이고(`PASS`, `PASS*`, `FAIL tree@stepN`, `FAIL integrity`, `n/a`), 하나가 더 있습니다. `FAIL batch`는 묶음 호출을 `serial` 1스레드로 돌려도 요청별 호출과 추측이 다른 경우입니다 (방식이 아니라 묶음 모듈이나 Arctic 버전 문제).
+
+### 합칠 때 점검
+```
+scripts\check_merge.bat          등록된 모든 방식을 Windows 와 WSL 에서 확인
+scripts\check_merge.bat tsan     ThreadSanitizer 까지
+```
+WSL 부분은 위 환경(`~/venv_arctic`, `~/arctic_stage`)이 있는 PC에서만 됩니다.
 
 ### 각 방식이 지킬 것 (내 방식이 그대로 쓰이도록)
 | 규칙 | 이유 |
@@ -299,8 +326,8 @@ bin/tree_bench_tsan data/tokens_code.bin --mode=<이름> --sched=phase --threads
 | `trees/tree_<이름>.cc`, `trees/<이름>/` | 방식별 구현 | **각자 자기 것만** |
 | `third_party/arctic/` | vLLM이 쓰는 Arctic Inference 트리 원본 (Apache-2.0). 검사용 `content_digest()` 하나만 추가 | 고치지 않음 |
 | `tools/` | `new_tree.py` (내 방식 뼈대), `prep_tokens.py` (데이터를 다시 만들 때만) | subtree_lock 담당 |
-| `scripts/` | `build.bat`, `build.sh`, `baseline.bat` / `run_all.bat`, `plot.py` (lazy 담당) | subtree_lock 담당, lazy 담당 |
-| `vllm_path/` | vLLM 실제 경로 측정 (7장, 준비 중) | subtree_lock 담당 |
+| `scripts/` | `build.bat`, `build.sh`, `baseline.bat`, `check_merge.bat`, `check_merge_wsl.sh` / `run_all.bat`, `plot.py` (lazy 담당) | subtree_lock 담당, lazy 담당 |
+| `vllm_path/` | vLLM 실제 경로 측정 (7장) | subtree_lock 담당 |
 | `premeasure/` | 사전 실험 1~4(문제 크기 확인) 재현용 프로그램. 사용법은 파일 맨 위 주석 | 고치지 않음 |
 | `data/` | 측정용 토큰 데이터 2개 (`KTOK` 형식) | 고치지 않음 |
 | `results/`, `bin/` | 결과, 실행 파일 (Git에 안 올라감) | |

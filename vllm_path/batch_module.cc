@@ -152,6 +152,21 @@ public:
         }
     }
 
+    // 요청 하나를 slot 자리에서 새로 시작한다 (vLLM 처럼 요청이 중간에 들고 날 때).
+    // slot 은 끝난 요청의 자리를 다시 쓰거나, 지금 요청 수와 같게 주어 맨 뒤에 하나 늘린다
+    void start_request(int slot, const Int32Array1D& prompt) {
+        if (slot < 0 || static_cast<size_t>(slot) > local_.size()) {
+            throw std::out_of_range("request slot out of range");
+        }
+        auto tree = std::make_unique<SuffixTree>(depth_);
+        tree->extend(0, std::span<const int32_t>(prompt.data(), prompt.size()));
+        if (static_cast<size_t>(slot) == local_.size()) {
+            local_.push_back(std::move(tree));
+        } else {
+            local_[slot] = std::move(tree);
+        }
+    }
+
     // 스텝 갱신: 요청마다 개인 트리와 전역 트리에 이번에 확정된 토큰을 붙인다.
     // 구간 1) 개인 트리 (요청마다 독립이라 항상 병렬)  구간 2) 전역 트리 (caps().par_update 일 때만 병렬)
     void update(const Int32Array1D& req_idx, const Int32Array1D& seq_ids,
@@ -290,6 +305,7 @@ NB_MODULE(tree_batch, m) {
         .def("prepare_seq", &BatchTree::prepare_seq)
         .def("extend_global", &BatchTree::extend_global)
         .def("start_requests", &BatchTree::start_requests)
+        .def("start_request", &BatchTree::start_request)
         .def("update", &BatchTree::update)
         .def("speculate", &BatchTree::speculate,
              nb::arg("req_idx"), nb::arg("ctx_flat"), nb::arg("ctx_off"),
