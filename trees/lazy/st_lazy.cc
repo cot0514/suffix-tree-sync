@@ -13,15 +13,41 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
 #include <cassert>
 #include <iostream>
 #include <queue>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 #include "st_lazy.h"
+#include "../../common/tree_iface.h"   // [lazy] LockWait, tctr (락 대기 시간·횟수 기록)
 
 namespace lazy {
+
+// [lazy] 첫 토큰 -> 서브트리 락 번호 (곱셈 해시 상위 6비트 = 64개)
+static inline size_t _subtree_index(int32_t first_token) {
+    return (static_cast<uint32_t>(first_token) * 2654435761u) >> (32 - 6);
+}
+
+// [lazy] 바로 잡히면 시계를 읽지 않고, 기다려야 할 때만 대기 시간을 잰다 (결과 표 lockw%)
+static inline void _lock_timed(Mutex& m) {
+    if (!m.try_lock()) {
+        LockWait w;
+        m.lock();
+    }
+}
+
+// [lazy] 활성 노드 하나를 처리하는 동안 잡은 락. 사라질 때 서브트리 락 -> 루트 락 순으로 푼다.
+struct HeldLocks {
+    Mutex* root = nullptr;
+    Mutex* subtree = nullptr;
+    ~HeldLocks() {
+        if (subtree) subtree->unlock();
+        if (root) root->unlock();
+    }
+};
 
 #define CHECK_OR_RETURN(cond) \
     if (!(cond)) return "Integrity check failed at line " + \
@@ -295,35 +321,50 @@ void _decrement_count(Node* node) {
 // Append a new element to a new or existing sequence.
 void SuffixTree::append(int seq_id, int token) {
     // Initialize the sequence if it doesn't exist.
+    // [lazy] 병렬로 부를 때는 prepare_seq 로 미리 만들어 둬야 한다 (여기서는 맵을 읽기만 하게).
     if (!_seqs.contains(seq_id)) {
-        assert(!_active_nodes.contains(seq_id));
-        _seqs.emplace(seq_id);
-        _active_nodes.emplace(seq_id);
+        prepare_seq(seq_id, 0);
     }
 
     // Keep references to the seq and active nodes for efficiency.
+    // (이 seq 의 vector·deque 는 이 seq 를 갱신하는 스레드 하나만 쓴다)
     std::vector<int32_t>& seq = _seqs[seq_id];
     std::deque<Node*>& active_nodes = _active_nodes[seq_id];
 
     // Insert a new active node at the root.
+    // [lazy] 루트 endpoints·count 는 루트 락을 잡는 "루트 활성 노드" 차례에 고친다 (아래 루프 안).
+    const int32_t root_endpoint = static_cast<int32_t>(seq.size());
     active_nodes.push_back(_root.get());
-    _root->endpoints[seq_id] = static_cast<int32_t>(seq.size());
-    _root->count += 1;
 
     // Ensure the number of active nodes doesn't exceed max_depth.
     if (active_nodes.size() > static_cast<size_t>(_max_depth)) {
         active_nodes.pop_front();
     }
-    seq.push_back(token);
+    seq.push_back(token);   // reserve 되어 있으면 재할당 없음 → 다른 스레드의 ref 읽기와 안전
     int32_t seq_len = static_cast<int32_t>(seq.size());
-    
-    // Iterate over all active nodes for this sequence.
-    for (Node*& active_node : active_nodes) {
+
+    // Process one active node (원본 루프 본문 그대로, [lazy] 좀비 처리만 추가).
+    // 호출하는 쪽이 그 활성 노드의 서브트리 락(필요하면 루트 락도)을 잡고 부른다.
+    auto process = [&](Node*& active_node) {
         Node* node = active_node;
         Node* child = nullptr;
         // [lazy] 논리적으로 지워진 자식(count 0)을 먼저 떼어 내야 아래 경우 분석의 전제
-        // (Case 1a: 자식 없음, Case 2: 자식 1개, 1b: tail 뒤에 붙여도 count 순서 유지)가 원본과 같아진다.
-        _purge_zombies(node);
+        // (Case 1a: 자식 없음, Case 2: 자식 1개)가 원본과 같아진다.
+        //  좀비는 count 줄이기(2단계)부터 end_step 사이에만 있다. phase 순서의 병렬 갱신 구간에는 없고,
+        //  serial/mixed 순서(1스레드)처럼 추측과 갱신이 번갈아 오면 갱신이 좀비를 만난다.
+        //  - 깊이 1 이상: 좀비 자식들은 node 와 같은 서브트리라 지금 잡은 서브트리 락으로 보호됨 → 전부 뗌
+        //  - 루트: 좀비 자식 Z 마다 서브트리(락)가 달라서, 지금 잡은 서브트리의 좀비(키 = token)만 떼고
+        //    나머지는 end_step 에서 뗀다. 루트는 Case 1a/2 가 없어 남은 좀비가 경우 분석에 영향이 없다.
+        if (node == _root.get()) {
+            auto z = node->children.find(token);
+            if (z != node->children.end() && z->second->count == 0) {
+                _remove_from_siblings(z->second.get());
+                node->children.erase(token);
+                tctr().extra[2]++;
+            }
+        } else {
+            _purge_zombies(node);
+        }
         auto it = node->children.find(token);
         if (it != node->children.end()) {
             child = it->second.get();
@@ -371,6 +412,9 @@ void SuffixTree::append(int seq_id, int token) {
                     assert(!node->head_child && !node->tail_child);
                     node->head_child = node->tail_child = new_child;
                     new_child->group.reset(new Group(new_child));
+                } else if (node->tail_child->count == 0) {
+                    // [lazy] 루트 맨 뒤에 좀비(count 0) 묶음이 남아 있으면 그 앞에 넣어야 count 순서 유지
+                    _insert_into_siblings_before(new_child, node->tail_child->group->head);
                 } else {
                     assert(node->tail_child);
                     _insert_into_siblings_after(new_child, node->tail_child);
@@ -505,6 +549,54 @@ void SuffixTree::append(int seq_id, int token) {
                 active_node = new_node;
             }
         }
+    };
+
+    // [lazy] 활성 노드 k 개는 시작 위치 seq_len-k .. seq_len-1 인 접미사들이고, 접미사의 경로는 항상
+    // 첫 토큰의 서브트리 안에 있다 → 활성 노드마다 그 서브트리 락 하나를 잡고 처리한다.
+    // 병렬 갱신 구간에는 count 를 줄이는 작업(mark)이 끼어들지 않으므로(_apply_marks 참고)
+    // 여기서 지켜야 할 것은 갱신끼리의 경쟁뿐이다.
+    const size_t active_count = active_nodes.size();
+    size_t active_pos = 0;
+    for (Node*& active_node : active_nodes) {
+        const bool is_root_active = (active_pos + 1 == active_count);   // 마지막 = 방금 넣은 루트
+        const int32_t first_token =
+            is_root_active ? token : seq[seq_len - active_count + active_pos];
+        ++active_pos;
+        Mutex& sub = _subtree_locks[_subtree_index(first_token)].m;
+        HeldLocks held;
+        if (is_root_active) {
+            // 루트에 자식을 만들거나 깊이 1 노드의 count 를 바꿈 → 루트 형제 리스트 수정
+            _lock_timed(_root_lock);
+            held.root = &_root_lock;
+            _lock_timed(sub);
+            held.subtree = &sub;
+            _root->endpoints[seq_id] = root_endpoint;
+            _root->count += 1;
+            tctr().extra[1]++;   // extra1 = 루트 락을 잡은 횟수
+        } else {
+            _lock_timed(sub);
+            held.subtree = &sub;
+            // 깊이 1 노드에서 Case 2a(합치기)가 일어나면 루트의 children·형제 리스트를 고친다
+            // → 서브트리 락을 풀고 루트 -> 서브트리 순으로 다시 잡는다 (락 순서 유지).
+            // 아직 아무것도 고치지 않았으므로 다시 잡는 사이에 상태가 바뀌어도 루트 락을 더 잡는 것뿐이다.
+            // (깊이 1 여부·2a 조건은 서브트리 락 아래에서만 안정적이다)
+            Node* cur = active_node;
+            if (cur->parent == _root.get()) {
+                _purge_zombies(cur);
+                auto c = cur->children.find(token);
+                if (c != cur->children.end() && cur->count == c->second->count + 1 &&
+                    c->second->length == 1) {
+                    sub.unlock();
+                    held.subtree = nullptr;
+                    _lock_timed(_root_lock);
+                    held.root = &_root_lock;
+                    _lock_timed(sub);
+                    held.subtree = &sub;
+                    tctr().extra[1]++;
+                }
+            }
+        }
+        process(active_node);
     }
 }
 
@@ -601,6 +693,7 @@ Draft SuffixTree::speculate(std::span<const int32_t> context,
                             float max_spec_offset,
                             float min_token_prob,
                             bool use_tree_spec) {
+    _apply_marks_if_pending();   // [lazy] 이번 스텝에 지운 seq 의 count 를 먼저 줄인다 (갱신 구간 뒤)
     Draft best_draft;
     for (int match_len = 1; match_len < context.size(); match_len++) {
         auto[node, idx] = _match_context(
@@ -942,26 +1035,95 @@ size_t SuffixTree::estimate_memory() const {
 
 // ---------------------------------------------------------------------------
 // [lazy] 논리적 삭제 / 물리적 삭제
-// 원본 remove() 의 앞부분(count 줄이기 + endpoints 지우기)만 한다. 원본은 count 가 1 인 자식을
-// 서브트리째 떼어 내지만, 여기서는 count 를 0 으로 만들고 멈춘다(형제 리스트 맨 뒤로 이동).
-// 그 아래 노드들의 count 는 그대로지만 count 0 노드 밑이라 아무도 내려가지 않는다.
+void SuffixTree::prepare_seq(int seq_id, int max_len) {
+    if (_pending_set.contains(seq_id)) {
+        // 지울 예정인 id 를 다시 쓰려 함 (Arctic 은 seq_id 가 2^31 에서 한 바퀴 돌면 재사용):
+        // 옛 토큰에 새 토큰이 이어 붙지 않도록 지금 count 를 줄이고 물리적으로 지운다.
+        _apply_marks();
+        _physical_remove(seq_id);
+        _pending_set.erase(seq_id);
+        _marked.erase(std::find(_marked.begin(), _marked.end(), seq_id));
+    }
+    if (!_seqs.contains(seq_id)) {
+        _seqs.emplace(seq_id);
+        _active_nodes.emplace(seq_id);
+    }
+    _seqs[seq_id].reserve(max_len);
+}
+
+// 삭제 1단계: id 를 큐에 넣기만 한다 (O(1), extend 와 동시에 불러도 됨).
 void SuffixTree::mark_removed(int seq_id) {
-    const std::vector<int>& seq = _seqs[seq_id];
-    for (int start = 0; start < static_cast<int>(seq.size()); start++) {
+    if (!_seqs.contains(seq_id)) {     // 맵은 읽기만 (operator[] 는 없는 키를 새로 만듦)
+        return;
+    }
+    _lock_timed(_pending_mu);
+    if (!_pending_set.contains(seq_id)) {   // 같은 id 를 두 번 지우면 count 가 두 번 줄어 깨짐 → 무시
+        _pending_set.emplace(seq_id);
+        _queued.push_back(seq_id);
+        _marks_pending.store(true, std::memory_order_release);
+    }
+    _pending_mu.unlock();
+}
+
+// 삭제 2단계: 큐의 seq 들의 count 를 한꺼번에 줄인다 (논리적 삭제 완료 = 추측에서 안 보임).
+// 갱신(extend)이 돌지 않는 시점에만 한다: 갱신 구간이 끝난 뒤 첫 speculate, 또는 end_step.
+//  - 왜 이 시점인가: 줄이기(_decrement_count)와 늘리기(_increment_count)는 같은 count 형제를 그룹
+//    맨 앞으로 옮기므로 순서에 따라 동점 형제의 순서가 달라진다. 둘이 같은 형제 리스트에서 섞이면
+//    추측이 serial 과 달라진다 (실측: 접미사마다 락을 잡고 갱신과 섞어 줄였을 때 4·12스레드에서
+//    동점 형제 순서 차이로 결정적 FAIL). 줄이기를 갱신과 섞지 않고 몰아서 하면 추측이 serial 과 같다.
+//  - 병렬로 하는 방법: 형제 리스트는 한 서브트리 안에 있으므로, 서브트리(락 번호)별로 한 스레드가
+//    그 서브트리의 접미사들을 serial 과 같은 순서(seq 순서 → 시작 위치 순서)로 줄이면 결과가 serial
+//    과 같다. 서브트리 사이에 공유되는 것은 루트 형제 리스트(깊이 1 노드 순서)뿐이고, 추측과 내용 비교는
+//    루트 형제 순서를 쓰지 않는다 → 깊이 1 노드를 줄일 때만 루트 락을 잡는다.
+// 1스레드(end_step, prepare_seq)에서는 같은 일을 순서대로 한다.
+
+// 묶음 만들기 (한 스레드, _apply_mu 아래): 큐를 비우고 서브트리별 할 일 목록을 만든다.
+void SuffixTree::_build_batch() {
+    std::vector<int32_t> ids;
+    _pending_mu.lock();
+    ids.swap(_queued);
+    _pending_mu.unlock();
+    for (int seq_id : ids) {
+        const std::vector<int32_t>& seq = _seqs.find(seq_id)->second;
+        _root->count -= static_cast<int64_t>(seq.size());   // 접미사마다 루트를 한 번씩 지남
+        for (int start = 0; start < static_cast<int>(seq.size()); start++) {
+            _batch[_subtree_index(seq[start])].push_back({seq_id, start});
+        }
+        _marked.push_back(seq_id);
+    }
+    _batch_next.store(0, std::memory_order_relaxed);
+    _batch_done.store(0, std::memory_order_relaxed);
+}
+
+// 서브트리 g 의 할 일 처리. 원본 remove() 의 앞부분(count 줄이기 + endpoints 지우기)과 같고,
+// count 가 1 인 자식을 서브트리째 떼는 대신 count 0 (좀비, 형제 리스트 맨 뒤)으로 두고 멈춘다.
+// 그 아래 노드들의 count 는 그대로지만 count 0 노드 밑이라 아무도 내려가지 않는다.
+void SuffixTree::_run_batch_group(int g, bool lock_root) {
+    int done = 0;
+    for (const auto& [seq_id, start] : _batch[g]) {
+        const std::vector<int32_t>& seq = _seqs.find(seq_id)->second;   // 맵 읽기만
         Node* node = _root.get();
-        node->count--;
         int idx = start;
+        bool depth1 = true;
         while (idx < static_cast<int>(seq.size())) {
-            auto it = node->children.find(seq[idx]);
+            auto it = node->children.find(seq[idx]);   // 2단계 중에는 children 을 고치지 않음
             if (it == node->children.end()) {
                 break;
             }
             Node* child = it->second.get();
             assert(child->count > 0);
             bool last = child->count == 1;
-            _decrement_count(child);   // 형제 순서까지 원본과 똑같이 바뀐다
+            if (depth1 && lock_root) {
+                _lock_timed(_root_lock);               // 깊이 1 노드 = 루트 형제 리스트
+                _decrement_count(child);
+                _root_lock.unlock();
+            } else {
+                _decrement_count(child);               // 형제 순서까지 원본과 똑같이 바뀐다
+            }
+            depth1 = false;
+            ++done;
             if (last) {
-                break;                 // 원본: 여기서 서브트리째 떼어 냄 → lazy: 좀비로 남김
+                break;                                 // 원본: 서브트리째 떼어 냄 → lazy: 좀비로 남김
             }
             if (child->endpoints.contains(seq_id)) {
                 child->endpoints.erase(seq_id);
@@ -970,16 +1132,65 @@ void SuffixTree::mark_removed(int seq_id) {
             node = child;
         }
     }
-    _pending_mu.lock();
-    _pending_remove.push_back(seq_id);
-    _pending_mu.unlock();
+    _batch[g].clear();
+    tctr().extra[3] += done;                           // extra3 = 줄인 노드 수
+}
+
+// 1스레드 버전 (end_step, prepare_seq).
+void SuffixTree::_apply_marks() {
+    _build_batch();
+    for (int g = 0; g < kSubtreeLocks; g++) {
+        _run_batch_group(g, false);
+    }
+    _batch_done.store(kSubtreeLocks, std::memory_order_relaxed);
+    _batch_built = false;
+    _marks_pending.store(false, std::memory_order_release);
+}
+
+// speculate 앞에서 부른다. 할 일이 없으면 원자 변수 하나만 읽고 끝난다.
+// 할 일이 있으면 지금 추측하러 온 스레드들이 서브트리 묶음을 나눠 처리하고, 모두 끝날 때까지
+// 기다렸다가 추측한다 (줄이는 중인 트리를 읽지 않도록).
+void SuffixTree::_apply_marks_if_pending() {
+    if (!_marks_pending.load(std::memory_order_acquire)) {
+        return;
+    }
+    _lock_timed(_apply_mu);
+    if (!_marks_pending.load(std::memory_order_acquire)) {   // 그 사이 다른 스레드가 끝냄
+        _apply_mu.unlock();
+        return;
+    }
+    if (!_batch_built) {
+        _build_batch();
+        _batch_built = true;
+    }
+    _apply_mu.unlock();
+    // 묶음 나눠 갖기 (공유 카운터)
+    for (int g; (g = _batch_next.fetch_add(1, std::memory_order_relaxed)) < kSubtreeLocks; ) {
+        _run_batch_group(g, true);
+        _batch_done.fetch_add(1, std::memory_order_release);
+    }
+    // 모든 묶음이 끝날 때까지 기다림 (acquire: 다른 스레드가 줄인 결과를 봄)
+    if (_batch_done.load(std::memory_order_acquire) < kSubtreeLocks) {
+        LockWait w;
+        while (_batch_done.load(std::memory_order_acquire) < kSubtreeLocks) {
+            std::this_thread::yield();
+        }
+    }
+    _lock_timed(_apply_mu);
+    if (_marks_pending.load(std::memory_order_relaxed)) {
+        _batch_built = false;
+        _marks_pending.store(false, std::memory_order_release);   // 끝난 뒤에 내림
+    }
+    _apply_mu.unlock();
 }
 
 int SuffixTree::flush_removed() {
-    // end_step 에서만 불리므로 다른 스레드가 없다. 그래도 목록은 락을 잡고 꺼낸다.
+    // end_step 에서만 불리므로 다른 스레드가 없다.
+    _apply_marks();                    // 추측이 없던 스텝(또는 stale 순서)의 줄이기도 여기서 마무리
     std::vector<int32_t> ids;
+    ids.swap(_marked);
     _pending_mu.lock();
-    ids.swap(_pending_remove);
+    for (int id : ids) _pending_set.erase(id);
     _pending_mu.unlock();
     for (int id : ids) _physical_remove(id);
     return static_cast<int>(ids.size());
@@ -994,6 +1205,7 @@ int SuffixTree::_purge_zombies(Node* node) {
         node->children.erase(z->token);   // unique_ptr 이 서브트리째 해제
         n++;
     }
+    if (n) tctr().extra[2] += n;          // extra2 = 떼어 낸 좀비 수 (append 중 + end_step 중)
     return n;
 }
 
