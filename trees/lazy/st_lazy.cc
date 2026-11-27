@@ -348,13 +348,8 @@ void SuffixTree::append(int seq_id, int token) {
     auto process = [&](Node*& active_node) {
         Node* node = active_node;
         Node* child = nullptr;
-        // [lazy] 논리적으로 지워진 자식(count 0)을 먼저 떼어 내야 아래 경우 분석의 전제
-        // (Case 1a: 자식 없음, Case 2: 자식 1개)가 원본과 같아진다.
-        //  좀비는 count 줄이기(2단계)부터 end_step 사이에만 있다. phase 순서의 병렬 갱신 구간에는 없고,
-        //  serial/mixed 순서(1스레드)처럼 추측과 갱신이 번갈아 오면 갱신이 좀비를 만난다.
-        //  - 깊이 1 이상: 좀비 자식들은 node 와 같은 서브트리라 지금 잡은 서브트리 락으로 보호됨 → 전부 뗌
-        //  - 루트: 좀비 자식 Z 마다 서브트리(락)가 달라서, 지금 잡은 서브트리의 좀비(키 = token)만 떼고
-        //    나머지는 end_step 에서 뗀다. 루트는 Case 1a/2 가 없어 남은 좀비가 경우 분석에 영향이 없다.
+        // [lazy] count 0 자식(좀비)을 먼저 떼어 아래 경우 분석의 전제를 맞춘다.
+        // 루트는 지금 잡은 서브트리의 좀비만 떼고 나머지는 end_step 에서 뗀다.
         if (node == _root.get()) {
             auto z = node->children.find(token);
             if (z != node->children.end() && z->second->count == 0) {
@@ -551,10 +546,7 @@ void SuffixTree::append(int seq_id, int token) {
         }
     };
 
-    // [lazy] 활성 노드 k 개는 시작 위치 seq_len-k .. seq_len-1 인 접미사들이고, 접미사의 경로는 항상
-    // 첫 토큰의 서브트리 안에 있다 → 활성 노드마다 그 서브트리 락 하나를 잡고 처리한다.
-    // 병렬 갱신 구간에는 count 를 줄이는 작업(mark)이 끼어들지 않으므로(_apply_marks 참고)
-    // 여기서 지켜야 할 것은 갱신끼리의 경쟁뿐이다.
+    // [lazy] 접미사의 경로는 첫 토큰의 서브트리 안에 있으므로 활성 노드마다 그 서브트리 락을 잡는다.
     const size_t active_count = active_nodes.size();
     size_t active_pos = 0;
     for (Node*& active_node : active_nodes) {
@@ -576,10 +568,7 @@ void SuffixTree::append(int seq_id, int token) {
         } else {
             _lock_timed(sub);
             held.subtree = &sub;
-            // 깊이 1 노드에서 Case 2a(합치기)가 일어나면 루트의 children·형제 리스트를 고친다
-            // → 서브트리 락을 풀고 루트 -> 서브트리 순으로 다시 잡는다 (락 순서 유지).
-            // 아직 아무것도 고치지 않았으므로 다시 잡는 사이에 상태가 바뀌어도 루트 락을 더 잡는 것뿐이다.
-            // (깊이 1 여부·2a 조건은 서브트리 락 아래에서만 안정적이다)
+            // 깊이 1 에서 Case 2a 는 루트를 고치므로 루트 -> 서브트리 순서로 다시 잡는다.
             Node* cur = active_node;
             if (cur->parent == _root.get()) {
                 _purge_zombies(cur);
@@ -1037,8 +1026,7 @@ size_t SuffixTree::estimate_memory() const {
 // [lazy] 논리적 삭제 / 물리적 삭제
 void SuffixTree::prepare_seq(int seq_id, int max_len) {
     if (_pending_set.contains(seq_id)) {
-        // 지울 예정인 id 를 다시 쓰려 함 (Arctic 은 seq_id 가 2^31 에서 한 바퀴 돌면 재사용):
-        // 옛 토큰에 새 토큰이 이어 붙지 않도록 지금 count 를 줄이고 물리적으로 지운다.
+        // 삭제 대기 중인 id 재사용: 옛 토큰에 이어 붙지 않도록 지금 지운다.
         _apply_marks();
         _physical_remove(seq_id);
         _pending_set.erase(seq_id);
@@ -1065,17 +1053,8 @@ void SuffixTree::mark_removed(int seq_id) {
     _pending_mu.unlock();
 }
 
-// 삭제 2단계: 큐의 seq 들의 count 를 한꺼번에 줄인다 (논리적 삭제 완료 = 추측에서 안 보임).
-// 갱신(extend)이 돌지 않는 시점에만 한다: 갱신 구간이 끝난 뒤 첫 speculate, 또는 end_step.
-//  - 왜 이 시점인가: 줄이기(_decrement_count)와 늘리기(_increment_count)는 같은 count 형제를 그룹
-//    맨 앞으로 옮기므로 순서에 따라 동점 형제의 순서가 달라진다. 둘이 같은 형제 리스트에서 섞이면
-//    추측이 serial 과 달라진다 (실측: 접미사마다 락을 잡고 갱신과 섞어 줄였을 때 4·12스레드에서
-//    동점 형제 순서 차이로 결정적 FAIL). 줄이기를 갱신과 섞지 않고 몰아서 하면 추측이 serial 과 같다.
-//  - 병렬로 하는 방법: 형제 리스트는 한 서브트리 안에 있으므로, 서브트리(락 번호)별로 한 스레드가
-//    그 서브트리의 접미사들을 serial 과 같은 순서(seq 순서 → 시작 위치 순서)로 줄이면 결과가 serial
-//    과 같다. 서브트리 사이에 공유되는 것은 루트 형제 리스트(깊이 1 노드 순서)뿐이고, 추측과 내용 비교는
-//    루트 형제 순서를 쓰지 않는다 → 깊이 1 노드를 줄일 때만 루트 락을 잡는다.
-// 1스레드(end_step, prepare_seq)에서는 같은 일을 순서대로 한다.
+// 삭제 2단계: 큐의 seq 들의 count 를 한꺼번에 줄인다 (갱신 구간 뒤 첫 speculate, 또는 end_step).
+// 갱신과 섞으면 동점 형제 순서가 serial 과 달라지므로 몰아서 하고, 서브트리별로 serial 순서를 지켜 병렬화한다.
 
 // 묶음 만들기 (한 스레드, _apply_mu 아래): 큐를 비우고 서브트리별 할 일 목록을 만든다.
 void SuffixTree::_build_batch() {
@@ -1095,9 +1074,7 @@ void SuffixTree::_build_batch() {
     _batch_done.store(0, std::memory_order_relaxed);
 }
 
-// 서브트리 g 의 할 일 처리. 원본 remove() 의 앞부분(count 줄이기 + endpoints 지우기)과 같고,
-// count 가 1 인 자식을 서브트리째 떼는 대신 count 0 (좀비, 형제 리스트 맨 뒤)으로 두고 멈춘다.
-// 그 아래 노드들의 count 는 그대로지만 count 0 노드 밑이라 아무도 내려가지 않는다.
+// 서브트리 g 의 count 줄이기 (원본 remove 앞부분). count 1 인 자식은 떼지 않고 0 으로 두고 멈춘다.
 void SuffixTree::_run_batch_group(int g, bool lock_root) {
     int done = 0;
     for (const auto& [seq_id, start] : _batch[g]) {
@@ -1147,9 +1124,7 @@ void SuffixTree::_apply_marks() {
     _marks_pending.store(false, std::memory_order_release);
 }
 
-// speculate 앞에서 부른다. 할 일이 없으면 원자 변수 하나만 읽고 끝난다.
-// 할 일이 있으면 지금 추측하러 온 스레드들이 서브트리 묶음을 나눠 처리하고, 모두 끝날 때까지
-// 기다렸다가 추측한다 (줄이는 중인 트리를 읽지 않도록).
+// speculate 앞에서 부른다. 할 일이 있으면 추측 스레드들이 서브트리를 나눠 줄이고 모두 끝날 때까지 기다린다.
 void SuffixTree::_apply_marks_if_pending() {
     if (!_marks_pending.load(std::memory_order_acquire)) {
         return;
