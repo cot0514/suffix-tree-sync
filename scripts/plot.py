@@ -1,6 +1,6 @@
 """Make plots and a summary table from run_all.bat results (CSV). Owner: lazy.
 
-  python scripts/plot.py                              # results/all_scale.csv, all_mixed.csv
+  python scripts/plot.py                              # results/all_scale.csv, all_stress.csv, all_mixed.csv
   python scripts/plot.py results/quick_scale.csv      # give CSV files directly (one or more)
   python scripts/plot.py --out results/plots --at 8   # output folder, thread count for plots 3 and 5
 
@@ -11,9 +11,12 @@ Output (--out folder)
   2_speedup.png      threads -> speedup over serial with 1 thread
   3_breakdown.png    time per phase at --at threads (local update, global update, remove, speculate, end), stacked
   4_lockwait.png     threads -> share of time spent waiting for locks
-  5_evict.png        evictions per step -> step time at --at threads
+  5_evict.png        evictions per step -> step time at --at threads (stress-test levels marked "stress")
   6_mixed.png        threads -> step time for the mixed schedule (when a mixed CSV is given)
   summary.md         per mode: 1-thread time, best time and its thread count, speedup over serial 1 thread
+
+Rows from a file whose name contains "stress" (run_all.bat stage 3: many evictions per step) are a stress
+test. They are kept out of plots 1-4 and only appear in plot 5 and the summary, labeled as stress.
 
 If the same condition (dataset, mode, schedule, threads, settings) appears more than once, the last row wins
 (a re-measurement). Each mode keeps a fixed color in every plot (serial, global_lock, subtree_lock, node_lock,
@@ -93,7 +96,9 @@ def load(paths):
         p = pathlib.Path(p)
         if not p.exists():
             continue
-        frames.append(pd.read_csv(p))
+        df = pd.read_csv(p)
+        df["stress"] = "stress" in p.name
+        frames.append(df)
     if not frames:
         return None
     df = pd.concat(frames, ignore_index=True)
@@ -198,11 +203,14 @@ def breakdown_figure(df, at, order, out):
 
 def evict_figure(df, at, order, styles, out):
     datas = sorted(df["data"].unique())
-    t = pick_threads(df, at)
+    t = pick_threads(df[~df["stress"]] if (~df["stress"]).any() else df, at)
     sub_all = df[df["threads"] == t]
+    if (df["stress"].any() and not sub_all["stress"].any()):
+        print(f"[WARN] stress rows have no {t}-thread result; plot 5 shows the main levels only")
     if sub_all["EVICT"].nunique() < 2:
         print("skip", out, "(only one eviction level)")
         return
+    stress_levels = set(sub_all.loc[sub_all["stress"], "EVICT"])
     fig, axes = plt.subplots(1, len(datas), figsize=(4.2 * len(datas), 3.6), squeeze=False)
     for c, d in enumerate(datas):
         ax = axes[0][c]
@@ -215,7 +223,9 @@ def evict_figure(df, at, order, styles, out):
             col, mk, ls = styles[m]
             ax.plot(s["EVICT"], s["step_ms"], color=col, marker=mk, linestyle=ls, linewidth=2, markersize=6,
                     markeredgecolor=SURFACE, markeredgewidth=1)
-        ax.set_xticks(sorted(sub["EVICT"].unique()))
+        ticks = sorted(sub["EVICT"].unique())
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([f"{e}\n(stress)" if e in stress_levels else str(e) for e in ticks])
         ax.set_title(d, fontsize=9, color=TEXT)
         ax.set_xlabel(L["evict"], fontsize=8, color=TEXT2)
         if c == 0:
@@ -247,7 +257,8 @@ def summary(df, order, out):
                 best = s.loc[s["step_ms"].idxmin()]
                 one_ms = f"{float(one['step_ms'].iloc[0]):.3f}" if not one.empty else "-"
                 x = f"x{b / best['step_ms']:.2f}" if b else "-"
-                lines.append(f"| {d} | {e} | {m} | {one_ms} | {best['step_ms']:.3f} ({int(best['threads'])}) | {x} | "
+                ev = f"{e} (stress)" if bool(s["stress"].any()) else str(e)
+                lines.append(f"| {d} | {ev} | {m} | {one_ms} | {best['step_ms']:.3f} ({int(best['threads'])}) | {x} | "
                              f"{best['lockwait_pct']:.1f} |")
     text = "\n".join(lines) + "\n"
     pathlib.Path(out).write_text(text, encoding="utf-8")
@@ -262,7 +273,8 @@ def main():
     ap.add_argument("--at", type=int, default=8,
                     help="thread count for the phase and eviction plots (falls back to the largest one below it)")
     a = ap.parse_args()
-    paths = a.csv or [ROOT / "results" / "all_scale.csv", ROOT / "results" / "all_mixed.csv"]
+    paths = a.csv or [ROOT / "results" / "all_scale.csv", ROOT / "results" / "all_stress.csv",
+                      ROOT / "results" / "all_mixed.csv"]
     df = load(paths)
     if df is None or df.empty:
         sys.exit(f"no CSV to read: {[str(p) for p in paths]}  (run scripts\\run_all.bat first)")
@@ -270,7 +282,10 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     order, styles = mode_styles(set(df["mode"]))
 
-    ph = df[df["sched"] == "phase"]
+    ph_all = df[df["sched"] == "phase"]
+    ph = ph_all[~ph_all["stress"]]             # main measurement only (stress test kept out of plots 1-4)
+    if ph.empty:
+        ph = ph_all                            # only stress rows were given: plot them anyway
     if not ph.empty:
         grid_figure(ph, "step_ms", L["step_ms"], L["t1"], order, styles, out / "1_step_ms.png")
         if (ph["mode"] == "serial").any():
@@ -280,8 +295,8 @@ def main():
             print("skip 2_speedup.png (no serial results)")
         breakdown_figure(ph, a.at, order, out / "3_breakdown.png")
         grid_figure(ph, "lockwait_pct", L["lockwait"], L["t4"], order, styles, out / "4_lockwait.png")
-        evict_figure(ph, a.at, order, styles, out / "5_evict.png")
-        summary(ph, order, out / "summary.md")
+        evict_figure(ph_all, a.at, order, styles, out / "5_evict.png")
+        summary(ph_all, order, out / "summary.md")
     mx = df[df["sched"] == "mixed"]
     if not mx.empty:
         grid_figure(mx, "step_ms", L["step_ms"], L["t6"], order, styles, out / "6_mixed.png")
