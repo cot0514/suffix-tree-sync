@@ -1,22 +1,23 @@
-"""run_all.bat 결과(CSV)로 그래프와 요약 표를 만든다 (lazy 담당).
+"""Make plots and a summary table from run_all.bat results (CSV). Owner: lazy.
 
   python scripts/plot.py                              # results/all_scale.csv, all_mixed.csv
-  python scripts/plot.py results/quick_scale.csv      # CSV 를 직접 지정 (여러 개 가능)
-  python scripts/plot.py --out results/plots --at 8   # 저장 폴더, 단계 분해·삭제 그래프의 스레드 수
+  python scripts/plot.py results/quick_scale.csv      # give CSV files directly (one or more)
+  python scripts/plot.py --out results/plots --at 8   # output folder, thread count for plots 3 and 5
 
-필요: pip install pandas matplotlib
+Requires: pip install pandas matplotlib
 
-만드는 것 (--out 폴더)
-  1_step_ms.png      스레드 수 → 스텝 시간 (행 = 데이터, 열 = 삭제 수). 주 결과
-  2_speedup.png      스레드 수 → serial 1스레드 대비 속도 향상
-  3_breakdown.png    --at 스레드에서 단계별 시간 (개인 갱신·전역 갱신·삭제·추측·end) 쌓은 막대
-  4_lockwait.png     스레드 수 → 락 기다린 비율
-  5_evict.png        --at 스레드에서 삭제 수 → 스텝 시간
-  6_mixed.png        mixed 순서의 스레드 수 → 스텝 시간 (mixed CSV 가 있을 때)
-  summary.md         방식별 1스레드 시간, 가장 빠른 시간과 그때 스레드 수, serial 1스레드 대비 배수
+Output (--out folder)
+  1_step_ms.png      threads -> step time (rows = dataset, columns = evictions per step). Main result
+  2_speedup.png      threads -> speedup over serial with 1 thread
+  3_breakdown.png    time per phase at --at threads (local update, global update, remove, speculate, end), stacked
+  4_lockwait.png     threads -> share of time spent waiting for locks
+  5_evict.png        evictions per step -> step time at --at threads
+  6_mixed.png        threads -> step time for the mixed schedule (when a mixed CSV is given)
+  summary.md         per mode: 1-thread time, best time and its thread count, speedup over serial 1 thread
 
-같은 조건(데이터·방식·순서·스레드·설정)이 여러 줄이면 CSV 에서 마지막 줄만 쓴다 (다시 잰 값).
-색은 방식마다 고정 (serial, global_lock, subtree_lock, node_lock, optimistic, lazy 순서, 그 밖의 방식은 그 뒤).
+If the same condition (dataset, mode, schedule, threads, settings) appears more than once, the last row wins
+(a re-measurement). Each mode keeps a fixed color in every plot (serial, global_lock, subtree_lock, node_lock,
+optimistic, lazy in that order; other modes take the remaining slots).
 """
 import argparse
 import pathlib
@@ -26,55 +27,34 @@ try:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib import font_manager
     import pandas as pd
 except ImportError:
-    sys.exit("pandas, matplotlib 가 필요합니다:  pip install pandas matplotlib")
+    sys.exit("pandas and matplotlib are required:  pip install pandas matplotlib")
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-if not sys.stdout.isatty():   # 파이프·파일로 보낼 때는 UTF-8 (Windows 기본 cp949 로 한글이 깨지는 것 방지)
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-# ---------------------------------------------------------------- 모양
-# 범주 색 8개 (색약 구분 검사 통과한 팔레트, 고정 순서). 같은 방식은 모든 그래프에서 같은 색.
+# ---------------------------------------------------------------- style
+# 8 categorical colors in a fixed order (palette checked for color-vision-deficiency separation).
+# A mode has the same color in every plot.
 PALETTE = ["#257de0", "#f47230", "#00b894", "#f2a600", "#ee7fac", "#008a17", "#6a4ce2", "#ec4647"]
-MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*"]   # 색만으로 구분하지 않도록 모양도 다르게
+MARKERS = ["o", "s", "^", "D", "v", "P", "X", "*"]   # shape too, so identity never depends on color alone
 KNOWN_MODES = ["serial", "global_lock", "subtree_lock", "node_lock", "optimistic", "lazy"]
-# 단계 = 처리 순서가 있는 값 → 파란색 한 색의 밝기 단계 (순서형)
+# Phases happen in a fixed order -> one blue hue, light to dark (ordinal)
 PHASES = ["ph_local_ms", "ph_global_ms", "ph_remove_ms", "ph_spec_ms", "ph_end_ms"]
 PHASE_COLORS = ["#84b9f3", "#519ced", "#257de0", "#1b64be", "#0e3d7e"]
 TEXT, TEXT2, GRID, SURFACE = "#191919", "#666666", "#e3e3e3", "#ffffff"
 KEY = ["data", "mode", "sched", "threads", "B", "N_CACHED", "STEPS", "EVICT", "local_par"]
 
-KO = {
-    "threads": "스레드 수", "step_ms": "스텝 시간 (ms, 작을수록 좋음)", "speedup": "serial 1스레드 대비 (배)",
-    "lockwait": "락 기다린 비율 (%)", "evict": "스텝마다 지우는 답변 수", "ms": "스텝 시간 (ms)",
-    "phases": ["개인 트리 갱신", "전역 트리 갱신", "삭제", "추측", "end (스텝 끝 정리)"],
-    "t1": "스레드 수에 따른 스텝 시간 (phase)", "t2": "속도 향상 (serial 1스레드 = 1)",
-    "t3": "{t}스레드에서 단계별 시간", "t4": "락 기다린 비율", "t5": "{t}스레드에서 삭제 양에 따른 스텝 시간",
-    "t6": "읽기·쓰기가 섞일 때 (mixed)", "evict_n": "삭제 {e}", "base": "기준",
-    "note3": "삭제를 갱신과 동시에 할 수 있는 방식(caps의 par_remove=true)은 측정 틀이 삭제를 전역 갱신 구간 안에서 돌리므로, 삭제 시간이 '전역 트리 갱신'에 들어간다.",
-}
-EN = {
+L = {
     "threads": "threads", "step_ms": "step time (ms, lower is better)", "speedup": "x vs serial 1 thread",
     "lockwait": "lock wait (%)", "evict": "responses evicted per step", "ms": "step time (ms)",
     "phases": ["local tree update", "global tree update", "remove", "speculate", "end (step cleanup)"],
     "t1": "Step time vs threads (phase)", "t2": "Speedup (serial 1 thread = 1)",
-    "t3": "Time per phase at {t} threads", "t4": "Lock wait", "t5": "Step time vs eviction at {t} threads",
-    "t6": "Reads and writes mixed (mixed)", "evict_n": "evict {e}", "base": "baseline",
-    "note3": "Modes with caps par_remove=true run removals inside the global update phase, so their removal time is counted in 'global tree update'.",
+    "t3": "Time per phase at {t} threads", "t4": "Lock wait", "t5": "Step time vs evictions at {t} threads",
+    "t6": "Reads and writes mixed (mixed)", "evict_n": "evict {e}",
+    "note3": "Modes with caps par_remove=true run removals inside the global update phase, "
+             "so their removal time is counted in 'global tree update'.",
 }
-
-
-def setup_fonts():
-    """한글 글꼴이 있으면 한글 라벨, 없으면 영어 라벨 (Linux/Colab 에서 네모 글자 방지)."""
-    names = {f.name for f in font_manager.fontManager.ttflist}
-    for name in ["Malgun Gothic", "AppleGothic", "NanumGothic", "Noto Sans KR", "Noto Sans CJK KR"]:
-        if name in names:
-            plt.rcParams["font.family"] = name
-            plt.rcParams["axes.unicode_minus"] = False
-            return KO
-    return EN
 
 
 def style_axes(ax):
@@ -89,7 +69,7 @@ def style_axes(ax):
 
 
 def mode_styles(modes):
-    """방식 → (색, 모양). 알려진 방식은 고정 칸, 나머지는 이름순으로 남은 칸."""
+    """mode -> (color, marker, line style). Known modes keep fixed slots, others take free slots by name."""
     order = [m for m in KNOWN_MODES if m in modes] + sorted(m for m in modes if m not in KNOWN_MODES)
     slots = {m: KNOWN_MODES.index(m) for m in order if m in KNOWN_MODES}
     free = [i for i in range(len(PALETTE)) if i not in slots.values()]
@@ -99,8 +79,8 @@ def mode_styles(modes):
     styles = {}
     for m in order:
         i = slots[m]
-        if i is None:   # 8개를 넘으면 색을 새로 만들지 않고 회색 점선으로 (방식 수를 줄이는 게 맞음)
-            print(f"[WARN] 방식이 8개를 넘어 '{m}' 은 회색 점선으로 그림")
+        if i is None:   # more than 8 modes: no new hues, gray dashed instead (better: plot fewer modes)
+            print(f"[WARN] more than 8 modes: '{m}' is drawn as a gray dashed line")
             styles[m] = ("#9c9c9c", "x", "--")
         else:
             styles[m] = (PALETTE[i], MARKERS[i], "-")
@@ -113,14 +93,12 @@ def load(paths):
         p = pathlib.Path(p)
         if not p.exists():
             continue
-        df = pd.read_csv(p)
-        df["_src"] = p.name
-        frames.append(df)
+        frames.append(pd.read_csv(p))
     if not frames:
         return None
     df = pd.concat(frames, ignore_index=True)
     df["data"] = df["data"].astype(str).str.replace(r"^tokens_", "", regex=True).str.replace(r"\.bin$", "", regex=True)
-    df = df.drop_duplicates(subset=KEY, keep="last")   # 같은 조건을 다시 쟀으면 마지막 값
+    df = df.drop_duplicates(subset=KEY, keep="last")   # a re-measured condition: keep the last value
     return df
 
 
@@ -130,9 +108,9 @@ def mode_handles(order, styles):
 
 
 def finish(fig, title, handles, labels, out, note=None):
-    """제목(맨 위) → 범례 → 그림 순서로 배치하고 저장. 위·아래 여백은 인치 단위로 고정."""
+    """Title on top, legend under it, plots below; margins fixed in inches. Then save."""
     h = fig.get_figheight()
-    top_in = 0.75                      # 제목 + 범례 높이 (인치)
+    top_in = 0.75                      # title + legend height (inches)
     bottom_in = 0.35 if note else 0.0
     fig.suptitle(title, y=1 - 0.12 / h, fontsize=11, color=TEXT, va="top")
     fig.legend(handles, labels, loc="upper center", ncol=min(len(labels), 6), frameon=False,
@@ -145,8 +123,8 @@ def finish(fig, title, handles, labels, out, note=None):
     print("saved", out)
 
 
-def grid_figure(df, L, value, ylabel, title, order, styles, out, transform=None, hline=None):
-    """행 = 데이터, 열 = 삭제 수, 선 = 방식, x = 스레드 수."""
+def grid_figure(df, value, ylabel, title, order, styles, out, transform=None, hline=None):
+    """rows = dataset, columns = evictions, lines = modes, x = threads."""
     datas, evicts = sorted(df["data"].unique()), sorted(df["EVICT"].unique())
     fig, axes = plt.subplots(len(datas), len(evicts), figsize=(3.6 * len(evicts), 2.9 * len(datas) + 0.8),
                              squeeze=False)
@@ -176,7 +154,7 @@ def grid_figure(df, L, value, ylabel, title, order, styles, out, transform=None,
             if c == 0:
                 ax.set_ylabel(ylabel, fontsize=8, color=TEXT2)
         top = max(row_max, hline or 0) * 1.08 or 1.0
-        for c in range(len(evicts)):   # 한 행은 같은 눈금 (삭제 수끼리 비교하기 쉽게)
+        for c in range(len(evicts)):   # one scale per row, so eviction levels compare directly
             axes[r][c].set_ylim(0, top)
     finish(fig, title, mode_handles(order, styles), order, out)
 
@@ -187,7 +165,7 @@ def pick_threads(df, want):
     return below[-1] if below else ts[-1]
 
 
-def breakdown_figure(df, L, at, order, out):
+def breakdown_figure(df, at, order, out):
     datas, evicts = sorted(df["data"].unique()), sorted(df["EVICT"].unique())
     t = pick_threads(df, at)
     sub_all = df[df["threads"] == t]
@@ -204,7 +182,7 @@ def breakdown_figure(df, L, at, order, out):
             for p, col in zip(PHASES, PHASE_COLORS):
                 vals = [float(sub.loc[m, p]) for m in ms]
                 ax.bar(range(len(ms)), vals, bottom=bottom, color=col, width=0.7,
-                       edgecolor=SURFACE, linewidth=1)   # 조각 사이 2px 틈
+                       edgecolor=SURFACE, linewidth=1)   # 2px gap between segments
                 bottom = [b + v for b, v in zip(bottom, vals)]
             ax.set_xticks(range(len(ms)))
             ax.set_xticklabels(ms, rotation=30, ha="right", fontsize=8)
@@ -218,12 +196,12 @@ def breakdown_figure(df, L, at, order, out):
     finish(fig, L["t3"].format(t=t), handles, L["phases"], out, note=L["note3"])
 
 
-def evict_figure(df, L, at, order, styles, out):
+def evict_figure(df, at, order, styles, out):
     datas = sorted(df["data"].unique())
     t = pick_threads(df, at)
     sub_all = df[df["threads"] == t]
     if sub_all["EVICT"].nunique() < 2:
-        print("skip", out, "(삭제 수가 하나뿐)")
+        print("skip", out, "(only one eviction level)")
         return
     fig, axes = plt.subplots(1, len(datas), figsize=(4.2 * len(datas), 3.6), squeeze=False)
     for c, d in enumerate(datas):
@@ -254,7 +232,7 @@ def speedup(s, sub):
 
 
 def summary(df, order, out):
-    lines = ["| 데이터 | 삭제 | 방식 | 1스레드 ms | 가장 빠른 ms (스레드) | serial 1스레드 대비 | 락 대기 % (그때) |",
+    lines = ["| data | evict | mode | 1-thread ms | best ms (threads) | vs serial 1 thread | lock wait % (at best) |",
              "|---|---|---|---|---|---|---|"]
     for d in sorted(df["data"].unique()):
         for e in sorted(df["EVICT"].unique()):
@@ -278,35 +256,35 @@ def summary(df, order, out):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="run_all.bat 결과 그래프")
-    ap.add_argument("csv", nargs="*", help="CSV 파일 (기본: results/all_scale.csv, results/all_mixed.csv)")
-    ap.add_argument("--out", default=str(ROOT / "results" / "plots"), help="저장 폴더")
-    ap.add_argument("--at", type=int, default=8, help="단계 분해·삭제 그래프에 쓸 스레드 수 (없으면 그 이하 중 가장 큰 값)")
+    ap = argparse.ArgumentParser(description="Plots from run_all.bat results")
+    ap.add_argument("csv", nargs="*", help="CSV files (default: results/all_scale.csv, results/all_mixed.csv)")
+    ap.add_argument("--out", default=str(ROOT / "results" / "plots"), help="output folder")
+    ap.add_argument("--at", type=int, default=8,
+                    help="thread count for the phase and eviction plots (falls back to the largest one below it)")
     a = ap.parse_args()
     paths = a.csv or [ROOT / "results" / "all_scale.csv", ROOT / "results" / "all_mixed.csv"]
     df = load(paths)
     if df is None or df.empty:
-        sys.exit(f"읽을 CSV 가 없습니다: {[str(p) for p in paths]}  (먼저 scripts\\run_all.bat)")
+        sys.exit(f"no CSV to read: {[str(p) for p in paths]}  (run scripts\\run_all.bat first)")
     out = pathlib.Path(a.out)
     out.mkdir(parents=True, exist_ok=True)
-    L = setup_fonts()
     order, styles = mode_styles(set(df["mode"]))
 
     ph = df[df["sched"] == "phase"]
     if not ph.empty:
-        grid_figure(ph, L, "step_ms", L["step_ms"], L["t1"], order, styles, out / "1_step_ms.png")
+        grid_figure(ph, "step_ms", L["step_ms"], L["t1"], order, styles, out / "1_step_ms.png")
         if (ph["mode"] == "serial").any():
-            grid_figure(ph, L, None, L["speedup"], L["t2"], order, styles, out / "2_speedup.png",
+            grid_figure(ph, None, L["speedup"], L["t2"], order, styles, out / "2_speedup.png",
                         transform=speedup, hline=1.0)
         else:
-            print("skip 2_speedup.png (serial 결과 없음)")
-        breakdown_figure(ph, L, a.at, order, out / "3_breakdown.png")
-        grid_figure(ph, L, "lockwait_pct", L["lockwait"], L["t4"], order, styles, out / "4_lockwait.png")
-        evict_figure(ph, L, a.at, order, styles, out / "5_evict.png")
+            print("skip 2_speedup.png (no serial results)")
+        breakdown_figure(ph, a.at, order, out / "3_breakdown.png")
+        grid_figure(ph, "lockwait_pct", L["lockwait"], L["t4"], order, styles, out / "4_lockwait.png")
+        evict_figure(ph, a.at, order, styles, out / "5_evict.png")
         summary(ph, order, out / "summary.md")
     mx = df[df["sched"] == "mixed"]
     if not mx.empty:
-        grid_figure(mx, L, "step_ms", L["step_ms"], L["t6"], order, styles, out / "6_mixed.png")
+        grid_figure(mx, "step_ms", L["step_ms"], L["t6"], order, styles, out / "6_mixed.png")
 
 
 if __name__ == "__main__":
